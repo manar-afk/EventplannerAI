@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 export const BudgetItemSchema = z.object({
-  id: z.string(),
+  id: z.string().max(64),
   name: z.string().min(1).max(100),
   category: z.string().min(1).max(50),
   cost_basis: z.enum(["per_guest", "fixed"]),
@@ -14,6 +14,7 @@ export const CategoryBreakdownSchema = z.object({
   category: z.string(),
   planned_amount: z.number().int().nonnegative(),
   actual_amount: z.number().int().nonnegative(),
+  effective_amount: z.number().int().nonnegative().default(0),
   item_count: z.number().int().nonnegative(),
 });
 
@@ -30,7 +31,7 @@ export const BudgetCalculationResultSchema = z.object({
 });
 
 export const MilestoneSchema = z.object({
-  id: z.string(),
+  id: z.string().max(64),
   title: z.string().min(1).max(120),
   category: z.string().min(1).max(50),
   target_date: z.string(),
@@ -53,7 +54,8 @@ export const TimelineResultSchema = z.object({
 });
 
 export const VendorItemSchema = z.object({
-  id: z.string(),
+  id: z.string().max(64),
+  budget_item_id: z.string().max(64).nullable().optional(),
   category: z.string().min(1).max(50),
   service_name: z.string().min(1).max(100),
   estimated_cost: z.number().int().nonnegative(),
@@ -76,7 +78,7 @@ export const GroupedIdeasSchema = z.object({
 });
 
 export const EventPlanSchema = z.object({
-  id: z.string(),
+  id: z.string().max(64),
   name: z.string().min(1).max(100),
   event_type: z.enum(["wedding", "birthday", "community"]),
   event_date: z.string(),

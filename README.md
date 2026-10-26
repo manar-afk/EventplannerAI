@@ -1,40 +1,36 @@
 # EventPilot AI — Indian Event & Wedding Planning Assistant
 
-EventPilot AI is a production-grade full-stack GenAI planning assistant designed specifically for weddings, birthdays, and community celebrations across India. It generates culturally grounded budgets in Indian Rupees (INR), milestone timelines (IST), vendor checklists, and personalized ideas.
+EventPilot AI is a full-stack GenAI planning assistant designed specifically for weddings, birthdays, and community celebrations across India. It generates culturally grounded budgets in Indian Rupees (INR), milestone schedules (IST), vendor checklists, and personalized ideas.
 
 ---
 
-## 🌟 Key Architecture & Engineering Highlights
+## 🌟 Key Architecture & Engineering Standards
 
 1. **Deterministic Python Budget Engine (`backend/app/budget_engine.py`)**:
-   - Pure functions with **integer rupee math only** (no floating point drift).
+   - Pure functions with **strict integer rupee math only** (no floating-point drift).
    - Strict separation of **Estimates vs. Actuals**.
-   - Formula: `Remaining Budget = Total Budget - (Actual if entered, otherwise Estimate)`.
+   - Formula: `Remaining Budget = Total Budget - Total Effective (Actual where entered, otherwise Estimate)`.
+   - `is_over_budget = remaining_budget < 0` and `over_budget_amount = max(0, -remaining_budget)`.
    - **AI Never Does Arithmetic**: Gemini suggests line items, unit costs, and basis weights. The backend engine computes allocations, totals, and flags over-budget scenarios without altering the user's budget.
-   - **Guest-count scaling** recalculates **only** per-guest items (e.g. catering, return gifts); fixed costs (e.g. venue hall, floral mandap, DJ) remain untouched.
+   - **Guest-count scaling** uses integer half-up math: `(2 * amount * new + old) // (2 * old)`. Recalculates **only** per-guest items (e.g. catering, favors); fixed costs remain untouched. User-entered actuals are never modified and are flagged for review.
 
 2. **IST Date & Timeline Engine (`backend/app/timeline_engine.py`)**:
-   - Dates are evaluated strictly in `Asia/Kolkata` (IST) timezone.
-   - Rejects past event dates at creation.
-   - Computes backwards milestone offsets by event type. Overdue or imminent milestones are tagged with `is_overdue` / `is_at_risk` banners; dates are **never moved silently**.
-   - Shows **days remaining**, not an artificial ticking timer.
+   - Evaluated strictly in `Asia/Kolkata` (IST) timezone.
+   - Rejects past event dates at creation (400 Bad Request).
+   - Computes backwards milestone offsets by event type. Overdue and at-risk flags apply strictly to **incomplete** milestones; computed dates are **never moved silently**.
+   - Shows **days remaining**, not a ticking timer.
 
 3. **Gemini Integration & Transparent Provenance**:
-   - Uses the unified `google-genai` SDK with structured JSON schemas and Pydantic validation.
-   - Delimits user text inputs (`<USER_INPUTS>`) to guard against prompt injection.
-   - Retries once on transient errors, enforces timeouts, and validates model output.
-   - **Transparent Source Tagging**: Plans carry either `source: "gemini"` or `source: "rule-based-fallback"`. Fallback output is never labeled as AI.
+   - Uses the unified `google-genai` SDK with Vertex AI Application Default Credentials (ADC) as default.
+   - User inputs inside `<USER_INPUTS>` are HTML-escaped and treated strictly as untrusted data.
+   - Retries only transient errors (429, 5xx, timeouts) and enforces `HttpOptions` timeouts.
+   - **Transparent Source Tagging**: Every plan carries either `source: "gemini"` or `source: "rule-based-fallback"`. Fallback output displays: *"Template plan, not personalised."*
 
 4. **Security & Resiliency**:
-   - Server-side request body size limit (1MB max).
-   - Max length constraints on all input fields.
-   - Generic client error responses with detailed server-side logging.
-   - In-memory rate limiting based on `X-Forwarded-For` (Cloud Run proxy).
+   - Path-traversal safe static file serving (`candidate.is_relative_to(DIST)`).
+   - Fail-closed CORS: empty `CORS_ORIGINS` defaults to localhost in development and `[]` in production; wildcard `*` is forbidden in production.
+   - Thread-safe sliding-window rate limiter evaluating client IP from the right of `X-Forwarded-For` (`parts[-trusted_proxy_hops]`) with a 10,000-key memory cap and global cap.
    - Zero `dangerouslySetInnerHTML`.
-
-5. **Client Persistence with Schema Recovery**:
-   - `LocalStoragePlanRepository` validates stored data with a Zod schema upon load.
-   - If corrupted or malformed data is found in `localStorage`, it recovers gracefully without crashing and displays a helpful recovery notice.
 
 ---
 
@@ -42,14 +38,14 @@ EventPilot AI is a production-grade full-stack GenAI planning assistant designed
 
 - **Frontend**: React 18, TypeScript 5, Vite 5, Tailwind CSS, Vitest.
 - **Backend**: Python 3.13, FastAPI, Pydantic v2, `google-genai` SDK, Uvicorn, Pytest.
-- **Container**: Multi-stage `Dockerfile` (Node 22 compiles SPA, Python 3.13 serves API + SPA on `$PORT`).
+- **Container**: Multi-stage `Dockerfile` (Node 22 compiles SPA, Python 3.13 serves API + SPA on `$PORT` as non-root `appuser`).
 
 ---
 
 ## 🚀 Local Development Setup
 
 ### 1. Prerequisites
-- Python 3.11+
+- Python 3.13
 - Node.js 18+ and npm (`npm.cmd` on Windows PowerShell)
 
 ### 2. Backend Setup
@@ -57,23 +53,26 @@ EventPilot AI is a production-grade full-stack GenAI planning assistant designed
 # Navigate to backend
 cd backend
 
-# (Optional) Create and activate virtual environment
+# Create and activate virtual environment
 python -m venv venv
 # On Windows:
 .\venv\Scripts\activate
 # On Linux/macOS:
 source venv/bin/activate
 
-# Install dependencies
-pip install -r requirements.txt
+# Install development dependencies
+pip install -r requirements-dev.txt
+
+# (Optional) Authenticate with Google Cloud Vertex AI ADC for local development:
+gcloud auth application-default login
 
 # Start backend server
 uvicorn app.main:app --host 127.0.0.1 --port 8080 --reload
 ```
 
-Backend endpoints:
+Endpoints:
 - API Documentation: `http://localhost:8080/docs`
-- Healthcheck: `http://localhost:8080/healthz`
+- Healthcheck: `http://localhost:8080/healthz` (returns `{"status":"ok"}`)
 
 ### 3. Frontend Setup
 ```bash
@@ -90,21 +89,13 @@ Open `http://localhost:5173` in your browser.
 
 ---
 
-## 🧪 Running Tests
+## 🧪 Running Tests & End-to-End Verification
 
 ### Backend Tests (Pytest)
 ```bash
-# Run all 17 Pytest unit and route tests
+# Run all 37 Pytest tests
 python -m pytest backend/tests -v
 ```
-Covers:
-- Integer rupee math and remaining balance calculations.
-- Over-budget flagging when proposed estimates exceed the user's budget.
-- Guest count scaling affecting only `per_guest` items.
-- Past-date rejection (400 Bad Request).
-- Overdue and at-risk milestone detection without altering computed dates.
-- Gemini fallback on malformed JSON and schema mismatch.
-- Static SPA serving from FastAPI.
 
 ### Frontend Tests (Vitest & TypeScript)
 ```bash
@@ -119,82 +110,78 @@ npm run lint
 # Build production assets
 npm run build
 ```
-Covers:
-- Indian currency formatting (`en-IN` lakh grouping, compact Lakh and Cr formats).
-- Days remaining calculations and past event detection.
-- `LocalStoragePlanRepository` schema validation, malformed JSON recovery, and state persistence.
+
+### End-to-End Journey Verification
+```bash
+# Run the automated end-to-end integration verification script
+python verify_e2e.py
+```
 
 ---
 
 ## ☁️ Google Cloud Run Deployment
 
-The project includes a single multi-stage `Dockerfile` where Stage 1 builds the Vite React application and Stage 2 serves both the compiled static assets and the FastAPI endpoints over `$PORT`.
+Deployment uses Google Cloud Run with Vertex AI Application Default Credentials (no API keys or Secret Manager needed).
 
-### 1. Build and Deploy with Google Cloud SDK
+### 1. Vertex AI GCP Project Setup
+Ensure the following are configured on your Google Cloud Project:
+1. **Enable Vertex AI API**:
+   ```bash
+   gcloud services enable aiplatform.googleapis.com run.googleapis.com
+   ```
+2. **Billing Enabled**: Confirm Cloud Billing is active on your project.
+3. **Grant Vertex AI User Role to Cloud Run Runtime Service Account**:
+   ```bash
+   gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
+     --member="serviceAccount:YOUR_PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+     --role="roles/aiplatform.user"
+   ```
+
+### 2. Deploy to Cloud Run
+Deploy directly from source using Google Cloud Build:
 ```bash
-# Set your Google Cloud Project
-gcloud config set project YOUR_PROJECT_ID
-
-# Build container image via Cloud Build
-gcloud builds submit --tag gcr.io/YOUR_PROJECT_ID/eventpilot-ai:latest .
-
-# Deploy to Cloud Run
 gcloud run deploy eventpilot-ai \
-  --image gcr.io/YOUR_PROJECT_ID/eventpilot-ai:latest \
+  --source . \
   --platform managed \
   --region us-central1 \
   --allow-unauthenticated \
-  --set-env-vars ENVIRONMENT=production,GEMINI_MODEL=gemini-2.5-flash \
-  --memory 512Mi \
-  --cpu 1
+  --max-instances 3 \
+  --set-env-vars ENVIRONMENT=production,GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID,GOOGLE_CLOUD_LOCATION=us-central1,GEMINI_MODEL=gemini-2.5-flash
 ```
 
-### 2. Secret Manager Integration for Production
-In production, do not hardcode credentials in environment variables. Store your API Key in Google Cloud Secret Manager:
+### 3. Reading Cloud Run Logs for Diagnostics
+If Gemini calls encounter issues in production, view detailed diagnostic logs:
 ```bash
-# 1. Create secret in Secret Manager
-gcloud secrets create GEMINI_API_KEY --replication-policy="automatic"
-echo -n "YOUR_GEMINI_API_KEY" | gcloud secrets versions add GEMINI_API_KEY --data-file=-
-
-# 2. Grant Cloud Run service account access
-gcloud secrets add-iam-policy-binding GEMINI_API_KEY \
-  --member="serviceAccount:YOUR_SERVICE_ACCOUNT@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/secretmanager.secretAccessor"
-
-# 3. Deploy Cloud Run referencing the secret
-gcloud run services update eventpilot-ai \
-  --region us-central1 \
-  --set-secrets GEMINI_API_KEY=GEMINI_API_KEY:latest
+gcloud run services logs read eventpilot-ai --limit 50
 ```
-
-> **Note on Vertex AI:** If your Cloud Run service account has `roles/aiplatform.user` granted, leave `GEMINI_API_KEY` empty. The `google-genai` SDK will automatically authenticate via Application Default Credentials (ADC).
+Common diagnostic hints logged server-side:
+- **Status 403**: Service account lacks `roles/aiplatform.user`.
+- **Status 404**: Gemini model not available in the configured region.
+- **"API has not been used"**: `aiplatform.googleapis.com` is not enabled on the project.
 
 ---
 
 ## ⚙️ Environment Variables Reference
 
-| Variable | Description | Default |
-| :--- | :--- | :--- |
-| `PORT` | HTTP port listened to by Uvicorn (Cloud Run dynamic injection) | `8080` |
-| `ENVIRONMENT` | Environment name (`development` / `production`) | `development` |
-| `GEMINI_API_KEY` | Google AI Studio API key for local development | `""` |
-| `GEMINI_MODEL` | Gemini model name (verify availability) | `gemini-2.5-flash` |
-| `GEMINI_TIMEOUT_SECONDS` | Timeout for Gemini API calls | `18.0` |
-| `CORS_ORIGINS` | Comma-separated list of allowed origins | `http://localhost:5173,...` |
-| `MAX_BODY_BYTES` | Maximum incoming payload size in bytes | `1048576` (1MB) |
-| `RATE_LIMIT_PER_MINUTE` | In-memory sliding window rate limit per client IP | `20` |
+| Variable | Description | Default | Allowed / Range |
+| :--- | :--- | :--- | :--- |
+| `PORT` | HTTP port listened to by Uvicorn | `8080` | `1 – 65535` |
+| `ENVIRONMENT` | Environment name | `development` | `development`, `production` |
+| `GOOGLE_CLOUD_PROJECT` | GCP Project ID for Vertex AI ADC | None | String |
+| `GOOGLE_CLOUD_LOCATION` | GCP Region for Vertex AI | `us-central1` | String |
+| `GEMINI_API_KEY` | Optional local development API key | `""` | Secret string |
+| `GEMINI_MODEL` | Gemini model name | `gemini-2.5-flash` | String |
+| `GEMINI_TIMEOUT_SECONDS`| HttpOptions timeout for model calls | `20.0` | `0.0 – 60.0` |
+| `CORS_ORIGINS` | Allowed CORS origins (comma-separated; `*` forbidden in production) | `""` | String |
+| `TRUSTED_PROXY_HOPS` | Number of proxy hops to parse client IP from right of `X-Forwarded-For` | `1` | `1 – 5` |
+| `RATE_LIMIT_PER_MINUTE` | Per-client IP sliding-window rate limit | `10` | `1 – 600` |
+| `RATE_LIMIT_GLOBAL_PER_MINUTE` | Global service-wide sliding-window rate limit | `120` | `1 – 10000` |
+| `MAX_BODY_BYTES` | Maximum incoming payload size in bytes | `1048576` (1MB) | `1024 – 10485760` |
 
 ---
 
-## 🔒 Security & Operational Considerations
+## 🔒 Operational Constraints & Known Limitations
 
-- **Per-Instance Rate Limiting**: The rate limiter operates in-memory using a sliding window. In multi-instance Cloud Run environments, each instance maintains its own bucket evaluated against the client IP from the `X-Forwarded-For` header. For high-volume multi-region clustering, consider Google Cloud Armor or Redis.
-- **LocalStorage Scope**: Event plans are persisted in client `localStorage` under `eventpilot_active_plan_v1`. Stored plans remain private to the user's browser/device.
-- **Prompt Injection Defense**: User input fields (themes, styles, requirements) are strictly typed with max length limits and wrapped in `<USER_INPUTS>` delimiters within prompts to prevent system instruction overrides.
-
----
-
-## 📝 Known Limitations
-
-- **Browser Storage Quota**: Storing plans in `localStorage` is device-bound and will not synchronize across different devices or incognito sessions.
-- **Offline Mode**: If offline and no prior plan was generated, new plans cannot be created without internet connectivity.
+- **Per-Instance Rate Limiting**: The sliding-window rate limiter is in-memory and operates per container instance.
+- **Device-Bound Persistence**: Event plans are stored in browser `localStorage` under `eventpilot_active_plan_v1`.
+- **Offline Generation**: Creating new plans requires connectivity to Vertex AI or the backend server.

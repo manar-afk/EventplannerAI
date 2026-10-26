@@ -1,58 +1,78 @@
 """Pure Python budget engine for EventPilot AI.
 
 Enforces integer rupee arithmetic, separate estimates vs actuals,
-guest-count scaling, and over-budget checks with zero floating-point drift.
-No I/O or network operations.
+guest-count scaling using integer half-up math, and over-budget checks
+with zero floating-point drift. No I/O or network operations.
 """
 
-from typing import List, Optional, Tuple, Dict, Any
-from pydantic import BaseModel, Field
+from typing import List, Optional, Tuple, Dict, Literal
+from pydantic import BaseModel, Field, StrictInt, field_validator
 
 MIN_GUESTS = 1
 MAX_GUESTS = 10_000
 MIN_BUDGET_INR = 1_000
-MAX_BUDGET_INR = 100_000_000  # 10 Crore INR limit to prevent absurd values
+MAX_BUDGET_INR = 100_000_000  # 10 Crore INR limit
+
+
+def truncate_with_ellipsis(text: Optional[str], max_len: int) -> str:
+    """Safely truncate text with an ellipsis if it exceeds max_len."""
+    if not text:
+        return ""
+    stripped = text.strip()
+    if len(stripped) <= max_len:
+        return stripped
+    return stripped[: max_len - 3] + "..."
 
 
 class BudgetItem(BaseModel):
-    id: str
+    id: str = Field(..., max_length=64)
     name: str = Field(..., max_length=100)
     category: str = Field(..., max_length=50)
-    cost_basis: str = Field(..., pattern="^(per_guest|fixed)$")
-    estimated_amount: int = Field(..., ge=0, le=MAX_BUDGET_INR)
-    actual_amount: Optional[int] = Field(None, ge=0, le=MAX_BUDGET_INR)
+    cost_basis: Literal["per_guest", "fixed"]
+    estimated_amount: StrictInt = Field(..., ge=0, le=MAX_BUDGET_INR)
+    actual_amount: Optional[StrictInt] = Field(None, ge=0, le=MAX_BUDGET_INR)
     notes: Optional[str] = Field(default="", max_length=300)
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def truncate_notes(cls, v: Optional[str]) -> str:
+        return truncate_with_ellipsis(v, 300)
 
 
 class CategoryBreakdown(BaseModel):
     category: str
-    planned_amount: int
-    actual_amount: int
-    item_count: int
+    planned_amount: StrictInt
+    actual_amount: StrictInt
+    effective_amount: StrictInt
+    item_count: StrictInt
 
 
 class BudgetCalculationResult(BaseModel):
-    total_budget: int
-    total_planned: int
-    total_actual: int
-    total_effective: int
-    remaining_budget: int
+    total_budget: StrictInt
+    total_planned: StrictInt
+    total_actual: StrictInt
+    total_effective: StrictInt
+    remaining_budget: StrictInt
     is_over_budget: bool
-    over_budget_amount: int
+    over_budget_amount: StrictInt
     categories: List[CategoryBreakdown]
     items: List[BudgetItem]
 
 
-def validate_budget_inputs(total_budget: int, guest_count: int) -> None:
-    """Validate constraints on total budget and guest count."""
+def validate_total_budget(total_budget: int) -> None:
+    """Validate bounds on total budget."""
     if not isinstance(total_budget, int) or isinstance(total_budget, bool):
-        raise ValueError("Total budget must be an integer.")
-    if not isinstance(guest_count, int) or isinstance(guest_count, bool):
-        raise ValueError("Guest count must be an integer.")
+        raise ValueError("Total budget must be a strict integer.")
     if total_budget < MIN_BUDGET_INR:
         raise ValueError(f"Total budget must be at least ₹{MIN_BUDGET_INR:,}.")
     if total_budget > MAX_BUDGET_INR:
         raise ValueError(f"Total budget exceeds maximum allowed limit of ₹{MAX_BUDGET_INR:,}.")
+
+
+def validate_guest_count(guest_count: int) -> None:
+    """Validate bounds on guest count."""
+    if not isinstance(guest_count, int) or isinstance(guest_count, bool):
+        raise ValueError("Guest count must be a strict integer.")
     if guest_count < MIN_GUESTS or guest_count > MAX_GUESTS:
         raise ValueError(f"Guest count must be between {MIN_GUESTS} and {MAX_GUESTS}.")
 
@@ -69,13 +89,11 @@ def calculate_budget(
     - Total actual = sum(item.actual_amount for items where actual_amount is not None)
     - Total effective = sum(item.actual_amount if item.actual_amount is not None else item.estimated_amount)
     - Remaining budget = total_budget - total_effective
-    - If total_effective > total_budget OR total_planned > total_budget, flagged as over-budget.
+    - is_over_budget = remaining_budget < 0
+    - over_budget_amount = max(0, -remaining_budget)
     - Never modifies total_budget.
     """
-    if not isinstance(total_budget, int) or isinstance(total_budget, bool):
-        raise ValueError("Total budget must be an integer.")
-    if total_budget < 0 or total_budget > MAX_BUDGET_INR:
-        raise ValueError(f"Invalid budget: {total_budget}. Must be between 0 and {MAX_BUDGET_INR}.")
+    validate_total_budget(total_budget)
 
     total_planned = 0
     total_actual = 0
@@ -87,11 +105,6 @@ def calculate_budget(
         est = item.estimated_amount
         act = item.actual_amount
 
-        if not isinstance(est, int) or est < 0:
-            raise ValueError(f"Item '{item.name}' has invalid estimated amount: {est}")
-        if act is not None and (not isinstance(act, int) or act < 0):
-            raise ValueError(f"Item '{item.name}' has invalid actual amount: {act}")
-
         total_planned += est
         if act is not None:
             total_actual += act
@@ -101,21 +114,23 @@ def calculate_budget(
         total_effective += effective
 
         if item.category not in category_map:
-            category_map[item.category] = {"planned": 0, "actual": 0, "count": 0}
+            category_map[item.category] = {"planned": 0, "actual": 0, "effective": 0, "count": 0}
         category_map[item.category]["planned"] += est
         if act is not None:
             category_map[item.category]["actual"] += act
+        category_map[item.category]["effective"] += effective
         category_map[item.category]["count"] += 1
 
     remaining_budget = total_budget - total_effective
-    is_over_budget = total_planned > total_budget or total_effective > total_budget
-    over_budget_amount = max(0, max(total_planned, total_effective) - total_budget)
+    is_over_budget = remaining_budget < 0
+    over_budget_amount = max(0, -remaining_budget)
 
     categories = [
         CategoryBreakdown(
             category=cat,
             planned_amount=data["planned"],
             actual_amount=data["actual"],
+            effective_amount=data["effective"],
             item_count=data["count"]
         )
         for cat, data in sorted(category_map.items())
@@ -138,43 +153,48 @@ def scale_budget_items_for_guests(
     items: List[BudgetItem],
     old_guest_count: int,
     new_guest_count: int
-) -> Tuple[List[BudgetItem], List[str]]:
-    """Recalculate only per-guest items when guest count changes.
+) -> Tuple[List[BudgetItem], List[str], List[str]]:
+    """Recalculate only per-guest item estimates using integer half-up scaling.
 
-    Fixed items are completely untouched.
+    Uses integer half-up formula: (2 * amount * new + old) // (2 * old).
+    Never modifies user-entered actuals; returns a list of items with actuals to review.
+    Raises ValueError if scaled estimate exceeds MAX_BUDGET_INR.
     Returns:
-        (updated_items, changed_item_names)
+        (updated_items, changed_item_names, items_with_actuals_to_review)
     """
-    validate_budget_inputs(MIN_BUDGET_INR, old_guest_count)
-    validate_budget_inputs(MIN_BUDGET_INR, new_guest_count)
+    validate_guest_count(old_guest_count)
+    validate_guest_count(new_guest_count)
 
     if old_guest_count == new_guest_count:
-        return [item.model_copy() for item in items], []
+        return [item.model_copy() for item in items], [], []
 
     updated_items: List[BudgetItem] = []
     changed_names: List[str] = []
+    review_actuals: List[str] = []
 
     for item in items:
         if item.cost_basis == "per_guest":
-            # Compute per-guest unit cost using integer math
-            # Round to nearest integer rupee
-            unit_cost = item.estimated_amount / old_guest_count
-            new_est = int(round(unit_cost * new_guest_count))
-            new_est = min(new_est, MAX_BUDGET_INR)
+            # Integer half-up scaling formula
+            new_est = (2 * item.estimated_amount * new_guest_count + old_guest_count) // (2 * old_guest_count)
+            if new_est > MAX_BUDGET_INR:
+                raise ValueError(
+                    f"Scaled estimate for '{item.name}' ({new_est}) exceeds maximum budget limit of ₹{MAX_BUDGET_INR:,}."
+                )
 
-            new_actual = None
+            if new_est != item.estimated_amount:
+                changed_names.append(item.name)
+
             if item.actual_amount is not None:
-                actual_unit = item.actual_amount / old_guest_count
-                new_actual = min(int(round(actual_unit * new_guest_count)), MAX_BUDGET_INR)
+                review_actuals.append(item.name)
 
+            # Never alter user-entered actuals!
             updated = item.model_copy(update={
                 "estimated_amount": new_est,
-                "actual_amount": new_actual
+                "actual_amount": item.actual_amount
             })
             updated_items.append(updated)
-            changed_names.append(item.name)
         else:
             # Fixed cost: untouched
             updated_items.append(item.model_copy())
 
-    return updated_items, changed_names
+    return updated_items, changed_names, review_actuals

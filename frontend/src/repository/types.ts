@@ -17,6 +17,7 @@ export interface CategoryBreakdown {
   category: string;
   planned_amount: number;
   actual_amount: number;
+  effective_amount: number;
   item_count: number;
 }
 
@@ -57,6 +58,7 @@ export interface TimelineResult {
 
 export interface VendorItem {
   id: string;
+  budget_item_id?: string | null;
   category: string;
   service_name: string;
   estimated_cost: number;

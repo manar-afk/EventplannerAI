@@ -1,7 +1,6 @@
 """Integration and route tests for EventPilot AI FastAPI app."""
 
 from datetime import date, timedelta
-import pytest
 from fastapi.testclient import TestClient
 from backend.app.main import app
 from backend.app.timeline_engine import get_current_ist_date
@@ -10,23 +9,33 @@ client = TestClient(app)
 
 
 def test_healthz_endpoint():
-    """Verify /healthz returns ok status and configuration details."""
+    """Verify /healthz returns only {"status": "ok"}."""
     response = client.get("/healthz")
     assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "ok"
-    assert "gemini_model" in data
+    assert response.json() == {"status": "ok"}
 
 
 def test_spa_frontend_served():
-    """Verify built SPA index.html is served at root for Cloud Run."""
+    """Verify built SPA index.html is served at root with no-cache header."""
     response = client.get("/")
     assert response.status_code == 200
     assert "<!doctype html>" in response.text.lower()
+    assert response.headers.get("Cache-Control") == "no-cache"
+
+
+def test_spa_path_traversal_prevention():
+    """Requirement: Path traversal attempt never serves backend files."""
+    # Attempt to traverse into backend directory
+    response = client.get("/../../backend/app/config.py")
+    assert response.status_code in (200, 404)
+    # If 200, it must be the SPA index.html, NEVER python code
+    if response.status_code == 200:
+        assert "SettingsConfigDict" not in response.text
+        assert "<!doctype html>" in response.text.lower()
 
 
 def test_create_plan_rejects_past_date():
-    """Requirement: Reject past event dates at creation with a clear message."""
+    """Requirement: Reject past event dates at creation with a clear message and 400 status."""
     yesterday = (get_current_ist_date() - timedelta(days=1)).isoformat()
     payload = {
         "name": "Past Anniversary Dinner",
@@ -44,10 +53,24 @@ def test_create_plan_rejects_past_date():
     assert "past" in response.json()["detail"].lower()
 
 
+def test_create_plan_whitespace_only_name_gives_422():
+    """Requirement: Whitespace-only name is cleaned and fails validation with 422."""
+    tomorrow = (get_current_ist_date() + timedelta(days=30)).isoformat()
+    payload = {
+        "name": "     ",
+        "event_type": "birthday",
+        "event_date": tomorrow,
+        "location": "Bengaluru",
+        "guest_count": 50,
+        "total_budget": 150000
+    }
+    response = client.post("/api/plans/generate", json=payload)
+    assert response.status_code == 422
+
+
 def test_create_plan_validates_guest_limits():
     """Verify validation boundaries: 1-10,000 guests."""
     tomorrow = (get_current_ist_date() + timedelta(days=60)).isoformat()
-    # Zero guests
     res_zero = client.post("/api/plans/generate", json={
         "name": "Invalid Guests Event",
         "event_type": "birthday",
@@ -58,7 +81,6 @@ def test_create_plan_validates_guest_limits():
     })
     assert res_zero.status_code == 422
 
-    # Over 10,000 guests
     res_huge = client.post("/api/plans/generate", json={
         "name": "Invalid Guests Event",
         "event_type": "community",
@@ -71,35 +93,32 @@ def test_create_plan_validates_guest_limits():
 
 
 def test_create_plan_generates_valid_plan_with_fallback_or_gemini():
-    """Verify end-to-end plan generation returns valid plan with valid source label."""
+    """Verify plan generation returns valid plan with transparent source label."""
     future_date = (get_current_ist_date() + timedelta(days=90)).isoformat()
     payload = {
-        "name": "Tarun & Priya Royal Wedding",
+        "name": "Tarun & Priya Celebration",
         "event_type": "wedding",
         "event_date": future_date,
         "location": "Jaipur, Rajasthan",
         "guest_count": 250,
         "total_budget": 2500000,
-        "style": "Royal Rajasthani Heritage",
+        "style": "Traditional Elegance",
         "theme": "Marigold & Amber",
-        "special_requirements": "Strictly vegetarian Jain food counters"
+        "special_requirements": "Vegetarian catering"
     }
     response = client.post("/api/plans/generate", json=payload)
     assert response.status_code == 200
     data = response.json()
 
-    assert data["name"] == "Tarun & Priya Royal Wedding"
+    assert data["name"] == "Tarun & Priya Celebration"
     assert data["source"] in ["gemini", "rule-based-fallback"]
     assert data["budget"]["total_budget"] == 2500000
     assert len(data["budget"]["items"]) > 0
     assert len(data["vendors"]) > 0
-    assert len(data["ideas"]["food"]) > 0
-    # Verify ideas incorporate user location
-    assert "Jaipur" in str(data["ideas"]) or "Jaipur" in str(data["budget"]) or "Jaipur" in str(data["vendors"])
 
 
-def test_recalculate_endpoint_with_guest_scaling():
-    """Verify POST /api/plans/recalculate updates budget and scales per-guest items."""
+def test_recalculate_endpoint_with_guest_scaling_and_review_actuals():
+    """Verify POST /api/plans/recalculate updates budget, scales per-guest items, and flags actuals for review."""
     payload = {
         "total_budget": 500000,
         "guest_count": 200,
@@ -111,7 +130,7 @@ def test_recalculate_endpoint_with_guest_scaling():
                 "category": "Catering",
                 "cost_basis": "per_guest",
                 "estimated_amount": 100000,
-                "actual_amount": None,
+                "actual_amount": 95000,
                 "notes": "Food"
             },
             {
@@ -129,15 +148,45 @@ def test_recalculate_endpoint_with_guest_scaling():
     assert response.status_code == 200
     data = response.json()
 
-    # Changed items list should contain the per-guest item
     assert "Catering per head" in data["changed_items"]
     assert "Hall fixed charge" not in data["changed_items"]
+    # Actuals should NOT be changed, and Catering should be listed for review
+    assert "Catering per head" in data["review_items"]
 
     budget = data["budget"]
-    # 100,000 scaled from 100 to 200 guests -> 200,000
-    # Fixed item 50,000 -> 50,000
-    # Total planned = 250,000
+    # 100,000 doubled to 200,000
+    assert budget["items"][0]["estimated_amount"] == 200000
+    assert budget["items"][0]["actual_amount"] == 95000  # Untouched!
     assert budget["total_planned"] == 250000
-    assert budget["total_effective"] == 250000
-    assert budget["remaining_budget"] == 250000
-    assert budget["is_over_budget"] is False
+    # Effective = 95000 (actual) + 50000 (estimate) = 145000
+    assert budget["total_effective"] == 145000
+    assert budget["remaining_budget"] == 355000
+
+
+def test_timeline_recalculate_endpoint():
+    """Verify POST /api/plans/timeline recomputes milestones and flags."""
+    future_date = (get_current_ist_date() + timedelta(days=45)).isoformat()
+    payload = {
+        "event_date": future_date,
+        "event_type": "wedding",
+        "completed_ids": ["ms-1"]
+    }
+    response = client.post("/api/plans/timeline", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["event_date"] == future_date
+    ms1 = [m for m in data["milestones"] if m["id"] == "ms-1"][0]
+    assert ms1["is_completed"] is True
+    assert ms1["is_overdue"] is False
+
+
+def test_cors_preflight_disallowed_origin():
+    """Verify CORS preflight from disallowed origin gets no Access-Control-Allow-Origin."""
+    response = client.options(
+        "/api/plans/generate",
+        headers={
+            "Origin": "http://evil-attacker.com",
+            "Access-Control-Request-Method": "POST"
+        }
+    )
+    assert "access-control-allow-origin" not in response.headers

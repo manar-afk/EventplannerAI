@@ -11,7 +11,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # =========================================================================
-# Stage 2: Python FastAPI production server (serves API + SPA on $PORT)
+# Stage 2: Production Python runtime (non-root, minimal layer)
 # =========================================================================
 FROM python:3.13-slim AS production
 
@@ -21,23 +21,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install system dependencies if required
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Create unprivileged runtime user
+RUN useradd -m -u 1000 -s /bin/bash appuser
 
-# Install Python requirements
+# Install production Python dependencies
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r ./backend/requirements.txt
 
-# Copy backend application code
-COPY backend/ ./backend/
+# Copy application files with ownership set to appuser
+COPY --chown=appuser:appuser backend/ ./backend/
+COPY --from=frontend-builder --chown=appuser:appuser /app/frontend/dist ./frontend/dist
 
-# Copy compiled frontend from Stage 1 into the location expected by main.py
-COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
+USER appuser
 
-# Expose Cloud Run port
 EXPOSE 8080
 
-# Run uvicorn listening on $PORT (set dynamically by Cloud Run runtime)
-CMD ["sh", "-c", "uvicorn backend.app.main:app --host 0.0.0.0 --port ${PORT}"]
+# Use exec to ensure uvicorn receives SIGTERM directly
+CMD ["sh", "-c", "exec uvicorn backend.app.main:app --host 0.0.0.0 --port ${PORT}"]

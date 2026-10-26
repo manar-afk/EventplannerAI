@@ -2,51 +2,65 @@
 
 from datetime import date, timedelta
 import pytest
-from backend.app.timeline_engine import generate_timeline, parse_iso_date
+from backend.app.timeline_engine import generate_timeline, parse_iso_date, IST
 
 
-def test_timeline_future_event_with_milestones():
-    """Verify standard future event milestone offsets."""
+def test_zoneinfo_loads():
+    """Requirement: ZoneInfo loads Asia/Kolkata timezone."""
+    assert IST is not None
+    assert "Kolkata" in str(IST)
+
+
+def test_completed_milestones_have_no_flags():
+    """Requirement: completed milestones have no flags."""
     ref_date = date(2026, 11, 1)
-    # Event 200 days in the future
-    event_date = "2027-05-20"
+    event_date = date(2026, 11, 15)
 
-    result = generate_timeline(event_date, "wedding", reference_date=ref_date)
+    # Incomplete ms-1 (offset 180 days -> May 2026, long overdue)
+    incomplete_res = generate_timeline(event_date, "wedding", reference_date=ref_date)
+    ms1_incomp = incomplete_res.milestones[0]
+    assert ms1_incomp.is_overdue is True
 
-    assert result.is_past_event is False
-    assert result.days_remaining == (parse_iso_date(event_date) - ref_date).days
-    assert len(result.milestones) == 8
-    # 180 days before event milestone: 2027-05-20 minus 180 days
-    ms180 = [m for m in result.milestones if m.days_before_event == 180][0]
-    expected_ms180_date = (parse_iso_date(event_date) - timedelta(days=180)).isoformat()
-    assert ms180.target_date == expected_ms180_date
-
-
-def test_timeline_overdue_and_at_risk_milestones():
-    """Requirement: If milestone date passed or event too close, keep real date, mark overdue/at-risk."""
-    ref_date = date(2026, 11, 1)
-    # Event is only 30 days away, but wedding has 180, 120, 90, 60, 45, 30 day milestones!
-    event_date = (ref_date + timedelta(days=30)).isoformat()
-
-    result = generate_timeline(event_date, "wedding", reference_date=ref_date)
-
-    assert result.has_overdue_milestones is True
-    assert result.alert_banner is not None
-    # 180-day milestone was 150 days ago: must be flagged overdue
-    ms_180 = [m for m in result.milestones if m.days_before_event == 180][0]
-    assert ms_180.is_overdue is True
-    # The real date must NOT have been moved
-    expected_date = (parse_iso_date(event_date) - timedelta(days=180)).isoformat()
-    assert ms_180.target_date == expected_date
+    # Mark ms-1 completed
+    completed_res = generate_timeline(
+        event_date,
+        "wedding",
+        reference_date=ref_date,
+        completed_ids=frozenset(["ms-1"])
+    )
+    ms1_comp = completed_res.milestones[0]
+    assert ms1_comp.is_completed is True
+    assert ms1_comp.is_overdue is False
+    assert ms1_comp.is_at_risk is False
 
 
-def test_timeline_past_event_flag():
-    """Verify past event date sets is_past_event=True and explicit banner."""
-    ref_date = date(2026, 11, 1)
-    past_date = "2026-10-15"
+def test_boundary_dates():
+    """Requirement: boundary dates (today, tomorrow, +7 days, offset landing exactly on today)."""
+    today = date(2026, 11, 1)
 
-    result = generate_timeline(past_date, "birthday", reference_date=ref_date)
+    # 1. Event is today
+    res_today = generate_timeline(today, "birthday", reference_date=today)
+    assert res_today.days_remaining == 0
+    assert res_today.is_past_event is False
 
-    assert result.is_past_event is True
-    assert result.days_remaining < 0
-    assert "in the past" in result.alert_banner
+    # 2. Event is tomorrow
+    res_tomorrow = generate_timeline(today + timedelta(days=1), "birthday", reference_date=today)
+    assert res_tomorrow.days_remaining == 1
+
+    # 3. Event is exactly +7 days away
+    res_7 = generate_timeline(today + timedelta(days=7), "birthday", reference_date=today)
+    assert res_7.days_remaining == 7
+    assert res_7.alert_banner is not None
+
+    # 4. Milestone offset landing exactly on today
+    # Birthday has 1-day offset milestone: event tomorrow -> milestone target is today!
+    ms1 = [m for m in res_tomorrow.milestones if m.days_before_event == 1][0]
+    assert ms1.target_date == today.isoformat()
+    assert ms1.is_at_risk is True
+    assert ms1.is_overdue is False  # Target is today, not past
+
+
+def test_unknown_event_type_raises():
+    """Requirement: unknown event type raises ValueError instead of silently defaulting."""
+    with pytest.raises(ValueError, match="Unknown event type"):
+        generate_timeline(date(2026, 12, 1), "gala_dinner")

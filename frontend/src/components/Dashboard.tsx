@@ -15,6 +15,7 @@ import { IdeasSection } from "./IdeasSection";
 interface DashboardProps {
   plan: EventPlan;
   isRecalculating: boolean;
+  reviewItems?: string[];
   onUpdateBudgetItems: (items: BudgetItem[]) => Promise<void>;
   onToggleMilestone: (id: string) => void;
   onUpdateVendorStatus: (id: string, status: VendorStatus) => void;
@@ -27,6 +28,7 @@ interface DashboardProps {
 export const Dashboard: React.FC<DashboardProps> = ({
   plan,
   isRecalculating,
+  reviewItems = [],
   onUpdateBudgetItems,
   onToggleMilestone,
   onUpdateVendorStatus,
@@ -52,6 +54,32 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   return (
     <div className="space-y-6">
+      {/* Prominent Template Fallback Banner */}
+      {plan.source === "rule-based-fallback" && (
+        <div className="p-4 bg-amber-50 border border-amber-300 rounded-2xl text-amber-950 flex items-start gap-3 shadow-sm" role="alert">
+          <span className="text-xl">📋</span>
+          <div>
+            <h4 className="font-bold text-sm">Template plan, not personalised</h4>
+            <p className="text-xs text-amber-800 mt-0.5">
+              Generated using built-in standard rules because Gemini was unconfigured or unavailable.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Review Actuals Notice after guest scaling */}
+      {reviewItems.length > 0 && (
+        <div className="p-4 bg-blue-50 border border-blue-200 rounded-2xl text-blue-900 flex items-start gap-3 shadow-sm" role="alert">
+          <span className="text-xl">ℹ️</span>
+          <div>
+            <h4 className="font-bold text-sm">Guest Count Updated: Please Review Actual Costs</h4>
+            <p className="text-xs text-blue-800 mt-0.5">
+              User-entered actuals were preserved without modification. Please verify if actual costs changed for: {reviewItems.join(", ")}.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Event Header Banner */}
       <div className="bg-white rounded-2xl shadow-sm border border-stone-200 p-6 md:p-8">
         <div className="flex flex-col md:flex-row md:items-start justify-between gap-4">

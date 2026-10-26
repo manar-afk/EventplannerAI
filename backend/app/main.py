@@ -1,13 +1,15 @@
 """FastAPI main application for EventPilot AI.
 
-Provides API routes for plan generation, recalculation, health checks,
-and serves compiled static frontend assets for single-container Cloud Run deployment.
+Provides API routes for plan generation, budget recalculation, timeline recalculation,
+health checks, and securely serves compiled static frontend assets with security headers.
 """
 
-import logging
-import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException, status, Depends
+import logging
+from pathlib import Path
+from typing import Set
+
+from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,53 +19,64 @@ from .schemas import (
     EventCreateRequest,
     FullPlanResponse,
     RecalculateRequest,
-    RecalculateResponse
+    RecalculateResponse,
+    TimelineRecalculateRequest,
 )
 from .budget_engine import calculate_budget, scale_budget_items_for_guests
-from .timeline_engine import parse_iso_date, get_current_ist_date
+from .timeline_engine import generate_timeline, get_current_ist_date, parse_iso_date, TimelineResult
 from .rate_limiter import InMemoryRateLimiter
-from .gemini_client import generate_plan_with_gemini_or_fallback
+from .gemini_client import generate_plan_with_gemini_or_fallback, get_auth_mode
 
-# Setup structured logging
+# Structured logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("eventpilot.api")
 
-rate_limiter = InMemoryRateLimiter(requests_per_minute=settings.rate_limit_per_minute)
+rate_limiter = InMemoryRateLimiter(
+    requests_per_minute=settings.rate_limit_per_minute,
+    global_per_minute=settings.rate_limit_global_per_minute,
+    trusted_proxy_hops=settings.trusted_proxy_hops,
+    max_keys=10_000,
+    window_seconds=60.0
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    auth_mode, project, location = get_auth_mode()
     logger.info("Starting EventPilot AI backend on port %d...", settings.port)
-    logger.info("CORS origins configured: %s", settings.cors_origins)
-    logger.info("Using Gemini model: %s", settings.gemini_model)
+    logger.info("Environment: %s", settings.environment)
+    logger.info("Auth mode chosen: %s (Project: %s, Location: %s)", auth_mode, project, location)
+    logger.info("Gemini model: %s, Timeout: %.1fs", settings.gemini_model, settings.gemini_timeout_seconds)
+    logger.info("Allowed CORS origins: %s", settings.allowed_cors_origins)
     yield
     logger.info("Shutting down EventPilot AI backend.")
 
 
 app = FastAPI(
-    title=settings.app_name,
+    title="EventPilot AI",
     version="1.0.0",
     docs_url="/docs",
     redoc_url=None,
     lifespan=lifespan
 )
 
-# 1. CORS middleware
+# 1. CORS middleware: fail-closed, no credentials, Content-Type header only
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
+    allow_origins=settings.allowed_cors_origins,
+    allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type"],
 )
 
 
-# 2. Request body size limit middleware
+# 2. Security Headers & Request Body Size Limit Middleware
 @app.middleware("http")
-async def limit_request_size_middleware(request: Request, call_next):
+async def security_and_size_middleware(request: Request, call_next):
+    # Enforce request body size limit
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -74,18 +87,24 @@ async def limit_request_size_middleware(request: Request, call_next):
                 )
         except ValueError:
             pass
-    return await call_next(request)
+
+    response = await call_next(request)
+
+    # Security headers
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+
+    # Immutable caching for static assets
+    if request.url.path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+
+    return response
 
 
 # 3. Global exception handler for safe generic client errors
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    if isinstance(exc, HTTPException):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"detail": exc.detail},
-            headers=exc.headers
-        )
     logger.exception("Unhandled server error processing %s: %s", request.url.path, exc)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -93,58 +112,38 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
-# 4. Healthcheck
+# 4. Healthcheck: returns strictly {"status": "ok"}
 @app.get("/healthz", tags=["System"])
 async def healthz():
-    return {
-        "status": "ok",
-        "app": settings.app_name,
-        "environment": settings.environment,
-        "gemini_model": settings.gemini_model,
-        "gemini_configured": bool(settings.gemini_api_key or os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
-    }
+    return {"status": "ok"}
 
 
-# 5. Plan Generation
+# 5. Plan Generation (synchronous def to run in threadpool, keeping event loop responsive)
 @app.post("/api/plans/generate", response_model=FullPlanResponse, tags=["Plans"])
-async def generate_plan(event: EventCreateRequest, request: Request):
-    # Enforce rate limit
+def generate_plan(event: EventCreateRequest, request: Request):
     rate_limiter.check_rate_limit(request)
 
-    # Validate that event date is not in the past at creation
-    try:
-        ev_date = parse_iso_date(event.event_date)
-        today_ist = get_current_ist_date()
-        if ev_date < today_ist:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Event date cannot be in the past ({event.event_date}). Please choose today or a future date."
-            )
-    except ValueError as val_err:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(val_err))
-
-    # Generate plan with Gemini or fallback
-    try:
-        plan = generate_plan_with_gemini_or_fallback(event)
-        return plan
-    except Exception as exc:
-        logger.exception("Error generating plan: %s", exc)
+    # Validate that event date is not in the past
+    today_ist = get_current_ist_date()
+    if event.event_date < today_ist:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate event plan. Please check inputs and try again."
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Event date cannot be in the past ({event.event_date.isoformat()}). Please choose today or a future date."
         )
 
+    return generate_plan_with_gemini_or_fallback(event)
 
-# 6. Budget & Guest Recalculation (No money math in frontend)
+
+# 6. Budget Recalculation
 @app.post("/api/plans/recalculate", response_model=RecalculateResponse, tags=["Budget"])
 async def recalculate_budget(payload: RecalculateRequest):
     items = payload.items
     changed_items = []
+    review_items = []
 
-    # If guest count changed, scale only per-guest items
     if payload.previous_guest_count is not None and payload.previous_guest_count != payload.guest_count:
         try:
-            items, changed_items = scale_budget_items_for_guests(
+            items, changed_items, review_items = scale_budget_items_for_guests(
                 items=items,
                 old_guest_count=payload.previous_guest_count,
                 new_guest_count=payload.guest_count
@@ -156,27 +155,44 @@ async def recalculate_budget(payload: RecalculateRequest):
         calc_result = calculate_budget(total_budget=payload.total_budget, items=items)
         return RecalculateResponse(
             budget=calc_result,
-            changed_items=changed_items
+            changed_items=changed_items,
+            review_items=review_items
         )
     except ValueError as err:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
 
 
-# 7. Static file serving for single-container Cloud Run deployment
-frontend_dist_path = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "dist")
-)
+# 7. Timeline Recalculation (Refreshes milestones and flags against current IST date)
+@app.post("/api/plans/timeline", response_model=TimelineResult, tags=["Timeline"])
+async def recalculate_timeline(payload: TimelineRecalculateRequest):
+    try:
+        completed_set = frozenset(payload.completed_ids)
+        return generate_timeline(
+            event_date_input=payload.event_date,
+            event_type=payload.event_type,
+            completed_ids=completed_set
+        )
+    except ValueError as err:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
 
-if os.path.exists(frontend_dist_path):
-    logger.info("Mounting built frontend static files from: %s", frontend_dist_path)
-    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist_path, "assets")), name="assets")
+
+# 8. Path-traversal safe SPA static file serving
+DIST = (Path(__file__).resolve().parent.parent.parent / "frontend" / "dist").resolve()
+
+if DIST.exists() and DIST.is_dir():
+    assets_dir = DIST / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(full_path: str):
-        # Allow API routes through
-        if full_path.startswith("api/") or full_path == "healthz" or full_path.startswith("docs"):
+        if full_path.startswith("api/"):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="API route not found")
-        file_path = os.path.join(frontend_dist_path, full_path)
-        if os.path.isfile(file_path):
-            return FileResponse(file_path)
-        return FileResponse(os.path.join(frontend_dist_path, "index.html"))
+
+        candidate = (DIST / full_path).resolve()
+        if candidate.is_relative_to(DIST) and candidate.is_file():
+            return FileResponse(candidate)
+
+        # Fallback to index.html with no-cache header
+        index_file = DIST / "index.html"
+        return FileResponse(index_file, headers={"Cache-Control": "no-cache"})

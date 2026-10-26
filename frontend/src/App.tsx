@@ -7,7 +7,7 @@ import {
   VendorItem,
 } from "./repository/types";
 import { planRepository } from "./repository/localStorageRepo";
-import { generatePlan, recalculateBudget } from "./api/client";
+import { generatePlan, recalculateBudget, recalculateTimeline } from "./api/client";
 import { EventForm } from "./components/EventForm";
 import { Dashboard } from "./components/Dashboard";
 import { ErrorNotice } from "./components/ErrorNotice";
@@ -16,26 +16,50 @@ export function App() {
   const [currentPlan, setCurrentPlan] = useState<EventPlan | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isRecalculating, setIsRecalculating] = useState<boolean>(false);
+  const [reviewItems, setReviewItems] = useState<string[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
 
-  // 1. Initial Load: Read from LocalStoragePlanRepository
+  // 1. Initial Load: Read from LocalStoragePlanRepository & refresh timeline flags
   useEffect(() => {
     const saved = planRepository.loadCurrentPlan();
     if (saved) {
       setCurrentPlan(saved);
+      // Refresh timeline flags against current IST date while preserving task completion
+      const completedIds = saved.timeline.milestones
+        .filter((m) => m.is_completed)
+        .map((m) => m.id);
+
+      recalculateTimeline({
+        event_date: saved.event_date,
+        event_type: saved.event_type,
+        completed_ids: completedIds,
+      })
+        .then((refreshedTimeline) => {
+          setCurrentPlan((prev) => {
+            if (!prev) return null;
+            const updated = { ...prev, timeline: refreshedTimeline };
+            planRepository.saveCurrentPlan(updated);
+            return updated;
+          });
+        })
+        .catch((err) => {
+          console.warn("Could not refresh timeline flags on initial load:", err);
+        });
     }
+
     const recoveryErr = planRepository.getRecoveryError();
     if (recoveryErr) {
       setRecoveryNotice(recoveryErr);
     }
   }, []);
 
-  // 2. Vertical Slice Step 1: Create event -> generate plan
+  // 2. Create event -> generate plan
   const handleCreatePlan = async (input: EventCreateInput) => {
     setIsLoading(true);
     setErrorMessage(null);
     setRecoveryNotice(null);
+    setReviewItems([]);
 
     try {
       const plan = await generatePlan(input);
@@ -48,7 +72,7 @@ export function App() {
     }
   };
 
-  // 3. Vertical Slice Step 3: Edit a budget item -> recalculate via Python backend -> persist
+  // 3. Edit budget item -> recalculate via backend
   const handleUpdateBudgetItems = async (newItems: BudgetItem[]) => {
     if (!currentPlan) return;
 
@@ -77,13 +101,19 @@ export function App() {
     }
   };
 
-  // 4. Milestone completion toggle
+  // 4. Milestone completion toggle (persisted and survives reloads)
   const handleToggleMilestone = (id: string) => {
     if (!currentPlan) return;
 
     const updatedMilestones = currentPlan.timeline.milestones.map((ms) => {
       if (ms.id === id) {
-        return { ...ms, is_completed: !ms.is_completed };
+        const nextCompleted = !ms.is_completed;
+        return {
+          ...ms,
+          is_completed: nextCompleted,
+          is_overdue: nextCompleted ? false : ms.is_overdue,
+          is_at_risk: nextCompleted ? false : ms.is_at_risk,
+        };
       }
       return ms;
     });
@@ -141,7 +171,7 @@ export function App() {
     planRepository.saveCurrentPlan(updatedPlan);
   };
 
-  // 7. Update guest count -> triggers per-guest item scaling via Python backend
+  // 7. Update guest count -> per-guest items scale, actuals preserved for review
   const handleUpdateGuestCount = async (newGuests: number) => {
     if (!currentPlan) return;
 
@@ -155,6 +185,12 @@ export function App() {
         previous_guest_count: currentPlan.guest_count,
         items: currentPlan.budget.items,
       });
+
+      if (resp.review_items && resp.review_items.length > 0) {
+        setReviewItems(resp.review_items);
+      } else {
+        setReviewItems([]);
+      }
 
       const updatedPlan: EventPlan = {
         ...currentPlan,
@@ -172,7 +208,7 @@ export function App() {
     }
   };
 
-  // 8. Regenerate plan with Gemini
+  // 8. Regenerate plan
   const handleRegenerate = async () => {
     if (!currentPlan) return;
     await handleCreatePlan({
@@ -188,17 +224,17 @@ export function App() {
     });
   };
 
-  // 9. Reset / Clear plan
+  // 9. Reset
   const handleReset = () => {
     planRepository.clearPlan();
     setCurrentPlan(null);
     setErrorMessage(null);
     setRecoveryNotice(null);
+    setReviewItems([]);
   };
 
   return (
     <div className="min-h-screen bg-stone-100/60 pb-16">
-      {/* Top Navbar */}
       <header className="bg-white border-b border-stone-200 sticky top-0 z-40 backdrop-blur-md bg-white/90">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -228,9 +264,7 @@ export function App() {
         </div>
       </header>
 
-      {/* Main Container */}
       <main className="max-w-6xl mx-auto px-4 sm:px-6 pt-6 space-y-6">
-        {/* Recovery Notice if corrupt data was restored safely */}
         {recoveryNotice && (
           <ErrorNotice
             title="Storage Recovery Notice"
@@ -240,7 +274,6 @@ export function App() {
           />
         )}
 
-        {/* Global Error Banner */}
         {errorMessage && (
           <ErrorNotice
             title="Operation Failed"
@@ -250,7 +283,6 @@ export function App() {
           />
         )}
 
-        {/* Dynamic View: Form vs Dashboard */}
         {!currentPlan ? (
           <div className="max-w-3xl mx-auto pt-4">
             <EventForm onSubmit={handleCreatePlan} isLoading={isLoading} />
@@ -259,6 +291,7 @@ export function App() {
           <Dashboard
             plan={currentPlan}
             isRecalculating={isRecalculating}
+            reviewItems={reviewItems}
             onUpdateBudgetItems={handleUpdateBudgetItems}
             onToggleMilestone={handleToggleMilestone}
             onUpdateVendorStatus={handleUpdateVendorStatus}

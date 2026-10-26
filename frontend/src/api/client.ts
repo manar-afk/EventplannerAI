@@ -3,11 +3,14 @@ import {
   EventPlan,
   BudgetItem,
   BudgetCalculationResult,
+  TimelineResult,
+  EventType,
 } from "../repository/types";
 
 export interface RecalculateResponse {
   budget: BudgetCalculationResult;
   changed_items: string[];
+  review_items: string[];
 }
 
 export class ApiError extends Error {
@@ -17,10 +20,31 @@ export class ApiError extends Error {
   }
 }
 
-const API_BASE = ""; // Uses Vite proxy in development; relative root in Cloud Run production
+const API_BASE = "";
+const REQUEST_TIMEOUT_MS = 45_000; // 45 seconds timeout
+
+async function fetchWithTimeout(url: string, options: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    return response;
+  } catch (err: any) {
+    if (err.name === "AbortError") {
+      throw new ApiError(408, "Request timed out after 45 seconds. The server may still be processing.");
+    }
+    throw err;
+  } finally {
+    clearTimeout(id);
+  }
+}
 
 export async function generatePlan(eventInput: EventCreateInput): Promise<EventPlan> {
-  const response = await fetch(`${API_BASE}/api/plans/generate`, {
+  const response = await fetchWithTimeout(`${API_BASE}/api/plans/generate`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -38,7 +62,7 @@ export async function generatePlan(eventInput: EventCreateInput): Promise<EventP
           : JSON.stringify(errorJson.detail);
       }
     } catch {
-      // Keep default error message
+      // Keep default
     }
     throw new ApiError(response.status, errorDetail);
   }
@@ -52,7 +76,7 @@ export async function recalculateBudget(payload: {
   previous_guest_count?: number;
   items: BudgetItem[];
 }): Promise<RecalculateResponse> {
-  const response = await fetch(`${API_BASE}/api/plans/recalculate`, {
+  const response = await fetchWithTimeout(`${API_BASE}/api/plans/recalculate`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -68,7 +92,7 @@ export async function recalculateBudget(payload: {
         errorDetail = typeof errorJson.detail === "string" ? errorJson.detail : JSON.stringify(errorJson.detail);
       }
     } catch {
-      // Use fallback error message
+      // Keep default
     }
     throw new ApiError(response.status, errorDetail);
   }
@@ -76,8 +100,37 @@ export async function recalculateBudget(payload: {
   return response.json();
 }
 
-export async function checkHealth(): Promise<{ status: string; gemini_model: string }> {
-  const response = await fetch(`${API_BASE}/healthz`);
+export async function recalculateTimeline(payload: {
+  event_date: string;
+  event_type: EventType;
+  completed_ids: string[];
+}): Promise<TimelineResult> {
+  const response = await fetchWithTimeout(`${API_BASE}/api/plans/timeline`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    let errorDetail = "Failed to update timeline.";
+    try {
+      const errorJson = await response.json();
+      if (errorJson?.detail) {
+        errorDetail = typeof errorJson.detail === "string" ? errorJson.detail : JSON.stringify(errorJson.detail);
+      }
+    } catch {
+      // Keep default
+    }
+    throw new ApiError(response.status, errorDetail);
+  }
+
+  return response.json();
+}
+
+export async function checkHealth(): Promise<{ status: string }> {
+  const response = await fetchWithTimeout(`${API_BASE}/healthz`, { method: "GET" });
   if (!response.ok) {
     throw new ApiError(response.status, "Health check failed");
   }
